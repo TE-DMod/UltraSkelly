@@ -8,44 +8,52 @@
   const ACK_KEY = 'skelly_ack_v2';
   const LONG_WARN_ACK_KEY = 'skelly_long_track_ack';
 
+  // Platform detection - macOS needs longer delays for Bluetooth reliability
+  const IS_MACOS = navigator.userAgent.toUpperCase().indexOf('MAC') >= 0;
+  // Base inter-chunk pacing; macOS kept conservative but reduced from 300 → 150ms
+  const CHUNK_DELAY_MS = IS_MACOS ? 150 : 50;
+
+  // Log storage for saving to file
+  const logHistory = [];
+
     // Long-audio warning
     const LONG_TRACK_LIMIT_SECONDS = 30;
     const LONG_TRACK_WARN = 'Uploading a track longer than 30 seconds is experimental, please proceed with caution.';
 
-    /** Get audio duration (in seconds) from a File. Tries <audio> first, falls back to WebAudio. */
-    async function getAudioDurationFromFile(file) {
-    // Fast path: use an off-DOM <audio> to read metadata
-    const viaElement = () => new Promise((resolve, reject) => {
-        const url = URL.createObjectURL(file);
-        const audio = new Audio();
-        audio.preload = 'metadata';
-        audio.onloadedmetadata = () => {
-        const d = audio.duration;
-        URL.revokeObjectURL(url);
-        // Some formats may report Infinity until enough data is loaded
-        if (isFinite(d) && d > 0) resolve(d); else reject(new Error('Non-finite duration'));
-        };
-        audio.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Audio element failed')); };
-        audio.src = url;
-    });
+  /** Get audio duration (in seconds) from a File. Tries <audio> first, falls back to WebAudio. */
+  async function getAudioDurationFromFile(file) {
+  // Fast path: use an off-DOM <audio> to read metadata
+  const viaElement = () => new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+    const d = audio.duration;
+    URL.revokeObjectURL(url);
+    // Some formats may report Infinity until enough data is loaded
+    if (isFinite(d) && d > 0) resolve(d); else reject(new Error('Non-finite duration'));
+    };
+    audio.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Audio element failed')); };
+    audio.src = url;
+  });
 
+  try {
+    return await viaElement();
+  } catch {
+    // Fallback: decode with Web Audio API
     try {
-        return await viaElement();
+    const buf = await file.arrayBuffer();
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    const ctx = new Ctx();
+    const audioBuf = await ctx.decodeAudioData(buf.slice(0)); // copy for Safari compatibility
+    ctx.close?.();
+    return audioBuf?.duration ?? null;
     } catch {
-        // Fallback: decode with Web Audio API
-        try {
-        const buf = await file.arrayBuffer();
-        const Ctx = window.AudioContext || window.webkitAudioContext;
-        if (!Ctx) return null;
-        const ctx = new Ctx();
-        const audioBuf = await ctx.decodeAudioData(buf.slice(0)); // copy for Safari compatibility
-        ctx.close?.();
-        return audioBuf?.duration ?? null;
-        } catch {
-        return null; // Unknown/unsupported type
-        }
+    return null; // Unknown/unsupported type
     }
-    }
+  }
+  }
 
 /** If duration exceeds limit, show a dismissible modal once (checkbox to hide in future). */
 async function maybeWarnLongTrack(durationSec) {
@@ -91,8 +99,13 @@ const ADV_KEYS = { raw:'skelly_adv_raw', ft:'skelly_adv_ft', fedc:'skelly_adv_fe
     const div = document.createElement('div');
     div.className = `line ${cls}`;
     const time = new Date().toLocaleTimeString();
-    div.textContent = `[${time}] ${msg}`;
+    const logLine = `[${time}] ${msg}`;
+    div.textContent = logLine;
     logEl.appendChild(div);
+
+    // Store in history for saving
+    logHistory.push(logLine);
+
     const auto = $('#chkAutoscroll');
     if (!auto || auto.checked) logEl.scrollTop = logEl.scrollHeight;
   }
@@ -103,7 +116,25 @@ const ADV_KEYS = { raw:'skelly_adv_raw', ft:'skelly_adv_ft', fedc:'skelly_adv_fe
     $('#progPct').textContent = `${pct}%`;
     $('#progBar').style.width = `${pct}%`;
   }
-  $('#btnClearLog')?.addEventListener('click', ()=>{ logEl.innerHTML=''; });
+  $('#btnClearLog')?.addEventListener('click', ()=>{
+    logEl.innerHTML='';
+    logHistory.length = 0; // Clear log history
+  });
+
+  // Save logs to file
+  $('#btnSaveLogs')?.addEventListener('click', ()=>{
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const filename = `ultraskelly-logs-${timestamp}.txt`;
+    const content = logHistory.join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    log(`Logs saved to ${filename}`, 'success');
+  });
 
   // --- Warning modal ---
   const riskModal = $('#riskModal');
@@ -361,11 +392,68 @@ advEdit?.addEventListener('change', () => {
     clearTimeout(files.timer);
   }
 
-  async function send(cmdBytes) {
+  async function send(cmdBytes, opts = {}) {
     if (!isConnected()) { log('Not connected', 'warn'); return; }
     const hex = bytesToHex(cmdBytes);
     log('TX ' + hex, 'tx');
-    await writeChar.writeValue(cmdBytes);
+    // Choose write method based on command type and characteristic capabilities
+    const c = writeChar;
+    if (!c) return;
+    const props = c.properties || {};
+    const tag = (cmdBytes && cmdBytes.length >= 2) ? cmdBytes[1] : 0x00; // 0xC0..C3, etc.
+    const doWrite = async (preferWithout) => {
+      if (preferWithout && typeof c.writeValueWithoutResponse === 'function' && props.writeWithoutResponse) {
+        return c.writeValueWithoutResponse(cmdBytes);
+      }
+      if (typeof c.writeValueWithResponse === 'function' && props.write) {
+        return c.writeValueWithResponse(cmdBytes);
+      }
+      if (!preferWithout && typeof c.writeValueWithoutResponse === 'function' && props.writeWithoutResponse) {
+        return c.writeValueWithoutResponse(cmdBytes);
+      }
+      if (typeof c.writeValue === 'function') {
+        return c.writeValue(cmdBytes);
+      }
+      return c.writeValue(cmdBytes);
+    };
+    try {
+      // Override preferences if explicitly requested
+      const forceWith = !!opts.forceWithResponse;
+      const forceWithout = !!opts.forceWithoutResponse;
+      let preferWithout = false;
+      if (forceWith) {
+        preferWithout = false;
+      } else if (forceWithout) {
+        preferWithout = true;
+      } else {
+        // Default: data chunks
+        // - On macOS, prefer with-response for C1 to improve reliability (esp. chunk 0)
+        // - Elsewhere, prefer without-response for throughput
+        preferWithout = (tag === 0xC1) ? !IS_MACOS : false;
+      }
+      await doWrite(preferWithout);
+    } catch (e1) {
+      log('Write error (first try): ' + (e1?.message || e1), 'warn');
+      // Brief backoff and try alternate path
+      await sleep(100);
+      try {
+        // Flip preference and retry
+        const forceWith = !!opts.forceWithResponse;
+        const forceWithout = !!opts.forceWithoutResponse;
+        let preferWithout = false;
+        if (forceWith) {
+          preferWithout = false;
+        } else if (forceWithout) {
+          preferWithout = true;
+        } else {
+          preferWithout = (tag === 0xC1) ? IS_MACOS : true; // flip from first try
+        }
+        await doWrite(preferWithout);
+      } catch (e2) {
+        log('Write error (retry): ' + (e2?.message || e2), 'warn');
+        throw e2;
+      }
+    }
   }
 
   function onNotify(e) {
@@ -548,13 +636,16 @@ advEdit?.addEventListener('change', () => {
       const dropped = parseInt(hex.slice(4,6),16);
       const index = parseInt(hex.slice(6,10),16);
       log(`Chunk Dropped: ${dropped} @${index}`);
-      if (transfer.inProgress && transfer.chunks.has(index)) {
-        const payload = transfer.chunks.get(index);
-        log(`Resending chunk ${index}`, 'warn');
-        send(buildCmd('C1', payload, 0));
+      // Queue retransmit requests; handled explicitly in loops
+      if (transfer.inProgress && !transfer.handlingRetransmits) {
+        transfer.retransmitQueue.push(index);
       }
     } else if (starts('BBC2')) {
       const failed = parseInt(hex.slice(4,6),16); log(`End Xfer: failed=${failed}`);
+      // If failure arrives mid-stream, mark so C1 loop can break into retransmit/C2 phase
+      if (failed === 1 && transfer.inProgress && !transfer.ending) {
+        transfer.midStreamEndFail = true;
+      }
     } else if (starts('BBC3')) { const failed = parseInt(hex.slice(4,6),16); log(`Rename: failed=${failed}`);
     } else if (starts('BBC4')) { const failed = parseInt(hex.slice(4,6),16); log(`Cancel: failed=${failed}`);
     } else if (starts('BBC5')) { const written = parseInt(hex.slice(4,12),16); log(`Resume written=${written}`);
@@ -614,7 +705,11 @@ advEdit?.addEventListener('change', () => {
     inProgress: false,
     cancel: false,
     resumeFrom: null, // set by device (e.g., after C2 fail) to resume index
-    chunks: new Map()
+    chunks: new Map(),
+  handlingRetransmits: false, // Set to true when we're manually handling BBC1 retransmits
+  retransmitQueue: [],       // queued BBC1 requests when not in explicit loop
+  midStreamEndFail: false,   // BBC2(failed) seen during C1 loop
+  ending: false              // true once we start C2/ack phase
   };
 
   // (kept if needed later for other ACK types)
@@ -649,6 +744,7 @@ advEdit?.addEventListener('change', () => {
   }
 
   async function sendFileToDevice(u8, name) {
+  log('sendFileToDevice called - v24: macOS adaptive pacing (150ms → 80ms when clean)', 'warn');
     if (!isConnected()) { log('Not connected — cannot send file.', 'warn'); return; }
 
     transfer.inProgress = true;
@@ -660,13 +756,19 @@ advEdit?.addEventListener('change', () => {
 
     try {
       // === Prep ===
-      const size = u8.length;
-      // Android uses requestMtu-3 then subtracts 2 more for C1 index -> (512-3-2)=507
-      const per = 500;
-      const maxPack = Math.ceil(size / per);
-      const nameHex = utf16leHex(name);
+  const size = u8.length;
+  // On macOS use smaller payloads to improve stability; elsewhere keep 500
+  // Keep macOS payload small so full C1 frame (AA C1 + idx2 + data + crc) <= ATT_MTU-3 (~182)
+  const per = IS_MACOS ? 160 : 500;
+  const maxPack = Math.ceil(size / per);
+  const nameHex = utf16leHex(name);
+  // Initialize adaptive pacing early so we can use it for pre-C0 and chunk0 timing
+  let paceMs = CHUNK_DELAY_MS;
 
-      // C0 (start)
+  // Start timestamp for throughput stats
+  const tStart = performance.now();
+  // C0 (start)
+  if (IS_MACOS) await sleep(Math.max(50, Math.floor((paceMs || CHUNK_DELAY_MS) / 2))); // dynamic debounce
       await send(buildCmd('C0', intToHex(size,4) + intToHex(maxPack,2) + '5C55' + nameHex, PAD_DEFAULT));
 
       // Wait for BBC0 before sending chunks
@@ -679,60 +781,255 @@ advEdit?.addEventListener('change', () => {
       let startIdx = Math.floor(c0Written / per);
       if (startIdx > 0) log(`Resuming at chunk index ${startIdx} (written=${c0Written})`, 'warn');
 
+  // Always send chunk 0; smaller per-chunk size + write-with-response should prevent macOS drop
+
       $('#btnCancelFile').disabled = false;
 
+  // Proactively send chunk 0 with response on macOS before the loop
+      if (IS_MACOS && startIdx === 0 && maxPack > 0) {
+        const off0 = 0;
+        const dataHex0 = chunkToHex(u8, off0, per);
+        const payload0 = intToHex(0, 2) + dataHex0;
+        transfer.chunks.set(0, payload0);
+        log('macOS: Proactively sending chunk 0 with response...', 'warn');
+  await send(buildCmd('C1', payload0, 0), { forceWithResponse: true });
+  // Small delay aligned with current adaptive pacing
+  await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS);
+        setProgress(1, maxPack);
+        startIdx = 1;
+      }
+
       // === Data loop (NO MTU padding) ===
+      transfer.midStreamEndFail = false;
+      transfer.retransmitQueue.length = 0;
+      transfer.ending = false;
+  // Adaptive pacing on macOS: start at CHUNK_DELAY_MS and ratchet down if clean
+  paceMs = CHUNK_DELAY_MS; // reassert start value (already declared above)
+      let goodSinceBbc1 = 0;
+      const PACE_FLOOR_MS = 80;
+      const PACE_DECR_STEP = 10;
+      const PACE_DECR_EVERY = 20; // chunks
+      const PACE_INCR_STEP = 20;
+      const PACE_MAX_MS = 250;
       for (let idx = startIdx; idx < maxPack; idx++) {
         if (!isConnected()) throw new Error('Disconnected during transfer');
         if (transfer.cancel) throw new Error('Transfer cancelled');
 
         if (transfer.resumeFrom !== null) { idx = transfer.resumeFrom; transfer.resumeFrom = null; }
 
+        // If device already indicated end fail or queued retransmits, pause C1 loop
+        if (transfer.midStreamEndFail || transfer.retransmitQueue.length) {
+          // Back off pacing slightly on retransmit
+          if (transfer.retransmitQueue.length && IS_MACOS) {
+            paceMs = Math.min(paceMs + PACE_INCR_STEP, PACE_MAX_MS);
+            log(`Breaking C1 loop early at idx=${idx} (BBC1 queued). Increasing pace to ${paceMs}ms`, 'warn');
+          } else {
+            log(`Breaking C1 loop early at idx=${idx} due to ${transfer.midStreamEndFail ? 'BBC2 fail' : 'queued BBC1'}`, 'warn');
+          }
+          break;
+        }
+
         const off = idx * per;
         const dataHex = chunkToHex(u8, off, per);   // exact bytes only
         const payload = intToHex(idx, 2) + dataHex;
 
-        transfer.chunks.set(idx, payload);
-        await send(buildCmd('C1', payload, 0));
+  transfer.chunks.set(idx, payload);
+  // On macOS, chunk 0 retransmits are sensitive; normal loop already sent chunk 0 earlier with-response
+  await send(buildCmd('C1', payload, 0));
         setProgress(idx + 1, maxPack);
-        await new Promise(r => setTimeout(r, 50));
-      }
+  await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS);
+        if (IS_MACOS) {
+          goodSinceBbc1++;
+          if (goodSinceBbc1 % PACE_DECR_EVERY === 0 && paceMs > PACE_FLOOR_MS) {
+            const prev = paceMs; paceMs = Math.max(paceMs - PACE_DECR_STEP, PACE_FLOOR_MS);
+            if (paceMs !== prev) log(`Adaptive pacing: ${prev}ms → ${paceMs}ms (clean streak)`, 'warn');
+          }
+        }
 
-      // === C2 (end) — must be 8 zero bytes ===
-      await send(buildCmd('C2', '', 8)); // -> AAC200000000000000004F
-
-      // Wait for BBC2 OK (isFailed==0)
-      let c2 = await waitForAck('BBC2', 240000);  // long timeout for large files
-      if (!c2) throw new Error('Timeout waiting for BBC2');
-      const c2Failed = parseInt(c2.slice(4,6), 16);
-      if (c2Failed !== 0) {
-        // device may include lastIndex after byte 6 if it wants resume
-        const lastIndex = c2.length >= 10 ? parseInt(c2.slice(6,10), 16) : 0;
-        transfer.resumeFrom = lastIndex;
-        // Re-run tail of data if needed
-        let tail = Math.min(maxPack, Math.max(0, transfer.resumeFrom));
-        while (tail < maxPack) {
-          if (transfer.cancel) throw new Error('Transfer cancelled');
-          const payload = transfer.chunks.get(tail);
-          if (!payload) break; // nothing cached
-          await send(buildCmd('C1', payload, 0));
-          tail += 1;
-          setProgress(tail, maxPack);
-          await new Promise(r => setTimeout(r, 12));
+        // Log when approaching the last chunk
+        if (idx === maxPack - 1) {
+          log(`C1 loop: Sent last chunk ${idx + 1}/${maxPack}. Loop will exit next.`, 'warn');
         }
       }
 
-      // === C3 (rename/commit) ===
+      log(`C1 loop: EXITED for loop. maxPack=${maxPack}, startIdx=${startIdx}`, 'warn');
+      log(`C1 loop complete. Sent ${maxPack} chunks.`, 'warn');
+
+      // Process any queued retransmits before C2, if present
+      if (transfer.retransmitQueue.length) {
+        transfer.handlingRetransmits = true;
+        const seen = new Set();
+        while (transfer.retransmitQueue.length) {
+          const rqIdx = transfer.retransmitQueue.shift();
+          if (seen.has(rqIdx)) continue; // prevent tight loops
+          seen.add(rqIdx);
+          const payload = transfer.chunks.get(rqIdx);
+          if (!payload) { log(`Queued retransmit ${rqIdx} not in cache`, 'warn'); continue; }
+          const forceWith = IS_MACOS && rqIdx === 0;
+          log(`Queued retransmit: sending chunk ${rqIdx}${forceWith?' (with-response)':''}`, 'warn');
+          await send(buildCmd('C1', payload, 0), forceWith ? { forceWithResponse: true } : undefined);
+          // After a retransmit on macOS, back off pacing once, then reset streak
+          if (IS_MACOS) {
+            const prev = paceMs; paceMs = Math.min(paceMs + PACE_INCR_STEP, PACE_MAX_MS);
+            if (paceMs !== prev) log(`Adaptive pacing: ${prev}ms → ${paceMs}ms (after retransmit)`, 'warn');
+            goodSinceBbc1 = 0;
+            await sleep(paceMs);
+          } else {
+            await sleep(CHUNK_DELAY_MS);
+          }
+        }
+        transfer.handlingRetransmits = false;
+      }
+
+      // Short macOS settle to let device raise BBC1s before C2
+      if (IS_MACOS && !transfer.midStreamEndFail) {
+        const EXTRA_WAIT_MS = Math.max(500, (paceMs || CHUNK_DELAY_MS) * 3);
+        log(`macOS: waiting ${EXTRA_WAIT_MS}ms before C2...`, 'warn');
+        await sleep(EXTRA_WAIT_MS);
+      }
+
+      // === C2 (end)  must be 8 zero bytes ===
+      log('Sending C2 (end transfer)...', 'warn');
+      transfer.ending = true;
+      await send(buildCmd('C2', '', 8)); // -> AAC200000000000000004F
+
+      // Wait for BBC2 OK (isFailed==0)
+      // Device may respond with BBC1 (chunk retransmit requests) first, then BBC2
+      log('Waiting for BBC2 response (device may request chunk retransmits first)...', 'warn');
+      let c2 = null;
+      let retryAttempts = 0;
+      const maxRetries = 100; // Allow up to 100 chunk retransmits
+
+      // Use longer timeouts on macOS which is slower to process retransmits
+  const ACK_WAIT_MS = IS_MACOS ? 8000 : 5000;
+
+      transfer.handlingRetransmits = true; // Disable automatic BBC1 handling while we explicitly handle retransmits
+
+      while (!c2 && retryAttempts < maxRetries) {
+        // Wait for either BBC1 (retransmit) or BBC2 (done)
+        const response = await Promise.race([
+          waitForAck('BBC1', ACK_WAIT_MS).catch(() => null),
+          waitForAck('BBC2', ACK_WAIT_MS).catch(() => null)
+        ]);
+
+        if (!response) {
+          retryAttempts++;
+          log(`No response, retry ${retryAttempts}/${maxRetries}`, 'warn');
+          continue;
+        }
+
+        if (response.startsWith('BBC2')) {
+          c2 = response;
+          log('BBC2 received', 'warn');
+          break;
+        }
+
+        if (response.startsWith('BBC1')) {
+          // Device wants a chunk retransmitted
+          let isFailed = parseInt(response.slice(4,6), 16);
+          let chunkIndex = parseInt(response.slice(6,10), 16);
+          if (isFailed === 1) {
+            log(`Device requests retransmit of chunk ${chunkIndex}`, 'warn');
+            // Try multiple attempts for this chunk and wait for device to respond after each send
+            const maxChunkRetrans = 6;
+            const perAttemptWait = Math.max(1500, CHUNK_DELAY_MS * 4);
+      for (let attempt = 1; attempt <= maxChunkRetrans; attempt++) {
+              const payload = transfer.chunks.get(chunkIndex);
+              if (!payload) { log(`Chunk ${chunkIndex} not found in cache, cannot retransmit`, 'warn'); break; }
+              log(`Retransmit attempt ${attempt}/${maxChunkRetrans} for chunk ${chunkIndex}`, 'warn');
+              // For macOS and chunk 0, force with-response to increase reliability
+              const forceWith = IS_MACOS && chunkIndex === 0;
+              await send(buildCmd('C1', payload, 0), forceWith ? { forceWithResponse: true } : undefined);
+              // After sending, wait briefly for a BBC2 (completion) or BBC1 (further requests)
+              const resp = await Promise.race([
+                waitForAck('BBC2', perAttemptWait).catch(() => null),
+                waitForAck('BBC1', perAttemptWait).catch(() => null)
+              ]);
+              if (!resp) {
+        // no response yet — keep/adapt pacing
+        await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS);
+                continue;
+              }
+              if (resp.startsWith('BBC2')) {
+                c2 = resp; log('BBC2 received (during retransmit attempts)', 'warn'); break;
+              }
+              // resp is BBC1 — parse and if it's asking for the same chunk, continue attempts; if different, update chunkIndex to handle it
+              const nextFailed = parseInt(resp.slice(4,6), 16);
+              const nextIdx = parseInt(resp.slice(6,10), 16);
+              if (nextFailed === 1 && nextIdx !== chunkIndex) {
+                log(`Device now requests retransmit of different chunk ${nextIdx} (was ${chunkIndex}), switching`, 'warn');
+                chunkIndex = nextIdx; // switch to the newly requested chunk and restart attempts
+                // reset attempt counter to give the new chunk its full attempts
+                attempt = 0;
+                continue;
+              }
+              // otherwise, loop will retry the same chunk
+            }
+          }
+          retryAttempts++;
+        }
+      }
+
+      transfer.handlingRetransmits = false; // Re-enable automatic BBC1 handling
+
+      if (!c2) throw new Error('Timeout waiting for BBC2 after retransmits');
+
+      const c2Failed = parseInt(c2.slice(4,6), 16);
+      if (c2Failed !== 0) {
+        // If macOS reported failure, give the device one more retransmit pass (many macs/parcels
+        // request BBC1s slightly after we receive BBC2) then resend C2 once.
+    if (IS_MACOS) {
+          log('BBC2 reported failure on macOS — running one extra retransmit pass then retrying C2...', 'warn');
+          transfer.handlingRetransmits = true;
+          // Listen for BBC1 requests for a short window and respond
+          const extraWindow = 4000; // ms
+          const endAt = Date.now() + extraWindow;
+          while (Date.now() < endAt) {
+            const resp = await waitForAck('BBC1', Math.min(1000, endAt - Date.now())).catch(() => null);
+            if (!resp) continue;
+            const isFailed = parseInt(resp.slice(4,6), 16);
+            if (isFailed === 1) {
+              const chunkIndex = parseInt(resp.slice(6,10), 16);
+              const payload = transfer.chunks.get(chunkIndex);
+              if (payload) {
+                log(`Extra-pass resend of chunk ${chunkIndex}`, 'warn');
+                await send(buildCmd('C1', payload, 0));
+                await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS);
+              }
+            }
+          }
+          transfer.handlingRetransmits = false;
+
+          // Resend C2 and wait one more time (longer)
+          log('Resending C2 (macOS extra retry)...', 'warn');
+          await send(buildCmd('C2', '', 8));
+          const finalC2 = await waitForAck('BBC2', 10000).catch(() => null);
+          if (!finalC2) throw new Error('Timeout waiting for BBC2 after macOS extra retry');
+          const finalFailed = parseInt(finalC2.slice(4,6), 16);
+          if (finalFailed !== 0) throw new Error('Device reported transfer failed even after macOS extra retry');
+        } else {
+          throw new Error('Device reported transfer failed even after retransmits.');
+        }
+      }
+
+  // === C3 (rename/commit) ===
+  // Shorter settle before C3
+  await sleep(200);
       await send(buildCmd('C3', '5C55' + nameHex, PAD_DEFAULT));
-      const c3 = await waitForAck('BBC3', 3000);
+      const c3 = await waitForAck('BBC3', 15000);  // Long timeout for flash write (especially on macOS)
       if (!c3) throw new Error('Timeout waiting for BBC3');
       const c3Failed = parseInt(c3.slice(4,6), 16);
       if (c3Failed !== 0) throw new Error('Device failed final rename');
 
-      log('File transfer complete ✔', 'warn');
+  const tEnd = performance.now();
+  const secs = (tEnd - tStart) / 1000;
+  const kb = (size / 1024).toFixed(1);
+  const rate = secs ? (size / secs / 1024).toFixed(1) : '∞';
+  log(`File transfer complete ✔  (${kb} KB in ${secs.toFixed(2)}s, ~${rate} KB/s)`, 'warn');
       startFetchFiles(); // refresh
     } catch (e) {
       log('File send error: ' + e.message, 'warn');
+      console.error('Full error details:', e);
     } finally {
       transfer.inProgress = false;
       $('#btnSendFile').disabled = false;
@@ -1154,7 +1451,7 @@ $('#fileInput').addEventListener('change', async (e)=>{
 });
 
     
-    $('#btnSendFile').addEventListener('click', async ()=>{
+  $('#btnSendFile').addEventListener('click', async ()=>{
     if (!isConnected()) return log('Not connected','warn');
 
     // Must have a chosen file
@@ -1343,6 +1640,7 @@ edUploadBtn.onclick = async () => {
   edUploadProg.textContent = 'Starting...';
 
   try {
+    const tStart = performance.now();
     let u8, targetName;
     if ($('#edChkConvert')?.checked) {
       const kbps = parseInt($('#edMp3Kbps')?.value || '32', 10);
@@ -1360,12 +1658,14 @@ edUploadBtn.onclick = async () => {
     }
 
     // ---- rest of your upload logic unchanged, but use u8 + targetName ----
-    const size = u8.length;
-    const per = 500;
+  const size = u8.length;
+  const per = IS_MACOS ? 160 : 500;
     const maxPack = Math.ceil(size / per);
     const nameHex = utf16leHex(targetName);
 
-    await send(buildCmd('C0', intToHex(size,4) + intToHex(maxPack,2) + '5C55' + nameHex));
+  // Small pre-C0 debounce on macOS
+  if (IS_MACOS) await sleep(100);
+  await send(buildCmd('C0', intToHex(size,4) + intToHex(maxPack,2) + '5C55' + nameHex));
     let c0 = await waitForAck('BBC0', 5000);
     if (!c0) throw new Error('Timeout waiting for BBC0');
     const c0Failed  = parseInt(c0.slice(4,6),16);
@@ -1374,31 +1674,178 @@ edUploadBtn.onclick = async () => {
     let startIdx = Math.floor(c0Written / per);
     if (startIdx > 0) log(`Resuming at chunk index ${startIdx} (written=${c0Written})`, 'warn');
 
+    // Proactively send chunk 0 with response on macOS
+    if (IS_MACOS && startIdx === 0 && maxPack > 0) {
+      const off0 = 0;
+      const dataHex0 = chunkToHex(u8, off0, per);
+      const payload0 = intToHex(0,2) + dataHex0;
+      transfer.chunks.set(0, payload0);
+      log('macOS: Proactively sending chunk 0 with response (edit modal)...','warn');
+  await send(buildCmd('C1', payload0, 0), { forceWithResponse: true });
+  // Small delay aligned with current adaptive pacing
+  await sleep(CHUNK_DELAY_MS); // will be replaced by paceMs once initialized below
+      startIdx = 1;
+      edUploadProg.textContent = `Uploading 1 / ${maxPack}`;
+    }
+
+  transfer.midStreamEndFail = false;
+    transfer.retransmitQueue.length = 0;
+    transfer.ending = false;
+  // Adaptive pacing on macOS for edit modal
+  let paceMs = CHUNK_DELAY_MS;
+  let goodSinceBbc1 = 0;
+  const PACE_FLOOR_MS = 80;
+  const PACE_DECR_STEP = 10;
+  const PACE_DECR_EVERY = 20;
+  const PACE_INCR_STEP = 20;
+  const PACE_MAX_MS = 250;
     for (let idx=startIdx; idx<maxPack; idx++) {
       if (!isConnected()) throw new Error('Disconnected during upload');
       if (transfer.cancel) throw new Error('Upload cancelled');
+      if (transfer.midStreamEndFail || transfer.retransmitQueue.length) {
+        log(`Edit: breaking C1 loop early at idx=${idx} due to ${transfer.midStreamEndFail ? 'BBC2 fail' : 'queued BBC1'}`, 'warn');
+        break;
+      }
       const off = idx * per;
       const dataHex = chunkToHex(u8, off, per);
       const payload = intToHex(idx,2) + dataHex;
       transfer.chunks.set(idx, payload);
       await send(buildCmd('C1', payload, 0));
       edUploadProg.textContent = `Uploading ${idx+1} / ${maxPack}`;
-      await new Promise(r => setTimeout(r, 12));
+  await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS);
+      if (IS_MACOS) {
+        goodSinceBbc1++;
+        if (goodSinceBbc1 % PACE_DECR_EVERY === 0 && paceMs > PACE_FLOOR_MS) {
+          const prev = paceMs; paceMs = Math.max(paceMs - PACE_DECR_STEP, PACE_FLOOR_MS);
+          if (paceMs !== prev) log(`Adaptive pacing (edit): ${prev}ms → ${paceMs}ms`, 'warn');
+        }
+      }
     }
 
-    await send(buildCmd('C2','',8));
-    let c2 = await waitForAck('BBC2', 3000);
-    if (!c2) throw new Error('Timeout waiting for BBC2');
-    const c2Failed = parseInt(c2.slice(4,6),16);
-    if (c2Failed !== 0) throw new Error('Device reported failure on end');
+    // If BBC1 arrived mid-stream, process queued retransmits before C2
+    if (transfer.retransmitQueue.length) {
+      transfer.handlingRetransmits = true;
+      const seen = new Set();
+      while (transfer.retransmitQueue.length) {
+        const rqIdx = transfer.retransmitQueue.shift();
+        if (seen.has(rqIdx)) continue; seen.add(rqIdx);
+        const payload = transfer.chunks.get(rqIdx);
+        if (!payload) { log(`Edit: queued retransmit ${rqIdx} not found`, 'warn'); continue; }
+        const forceWith = IS_MACOS && rqIdx === 0;
+        log(`Edit: queued retransmit send chunk ${rqIdx}${forceWith?' (with-response)':''}`, 'warn');
+        await send(buildCmd('C1', payload, 0), forceWith ? { forceWithResponse: true } : undefined);
+        if (IS_MACOS) {
+          const prev = paceMs; paceMs = Math.min(paceMs + PACE_INCR_STEP, PACE_MAX_MS);
+          if (paceMs !== prev) log(`Adaptive pacing (edit): ${prev}ms → ${paceMs}ms (after retransmit)`, 'warn');
+          goodSinceBbc1 = 0;
+          await sleep(paceMs);
+        } else {
+          await sleep(CHUNK_DELAY_MS);
+        }
+      }
+      transfer.handlingRetransmits = false;
+    }
 
+    // Send C2 and handle possible retransmit requests like the main upload flow.
+    if (IS_MACOS) {
+      const EXTRA_WAIT_MS = Math.max(500, (paceMs || CHUNK_DELAY_MS) * 3);
+      log(`macOS: waiting ${EXTRA_WAIT_MS}ms for retransmit requests before sending C2 (edit modal)...`, 'warn');
+      await sleep(EXTRA_WAIT_MS);
+    }
+
+    log('Edit modal: Sending C2 (end transfer)...', 'warn');
+    transfer.ending = true;
+    await send(buildCmd('C2', '', 8));
+
+    // Use longer timeouts on macOS
+    const ACK_WAIT_MS = IS_MACOS ? 8000 : 5000;
+    let c2 = null;
+    let retryAttempts = 0;
+    const maxRetries = 100;
+    transfer.handlingRetransmits = true;
+
+    while (!c2 && retryAttempts < maxRetries) {
+      const response = await Promise.race([
+        waitForAck('BBC1', ACK_WAIT_MS).catch(() => null),
+        waitForAck('BBC2', ACK_WAIT_MS).catch(() => null)
+      ]);
+      if (!response) { retryAttempts++; log(`Edit: no response, retry ${retryAttempts}/${maxRetries}`, 'warn'); continue; }
+      if (response.startsWith('BBC2')) { c2 = response; log('Edit: BBC2 received', 'warn'); break; }
+  if (response.startsWith('BBC1')) {
+        let isFailed = parseInt(response.slice(4,6), 16);
+        let chunkIndex = parseInt(response.slice(6,10), 16);
+        if (isFailed === 1) {
+          log(`Edit: Device requests retransmit of chunk ${chunkIndex}`, 'warn');
+          const maxChunkRetrans = 6;
+          const perAttemptWait = Math.max(1500, CHUNK_DELAY_MS * 4);
+          for (let attempt = 1; attempt <= maxChunkRetrans; attempt++) {
+            const payload = transfer.chunks.get(chunkIndex);
+            if (!payload) { log(`Edit: Chunk ${chunkIndex} not found in cache`, 'warn'); break; }
+            log(`Edit: Retransmit attempt ${attempt}/${maxChunkRetrans} for chunk ${chunkIndex}`,'warn');
+    const forceWith = IS_MACOS && chunkIndex === 0;
+    await send(buildCmd('C1', payload, 0), forceWith ? { forceWithResponse: true } : undefined);
+            const resp = await Promise.race([
+              waitForAck('BBC2', perAttemptWait).catch(() => null),
+              waitForAck('BBC1', perAttemptWait).catch(() => null)
+            ]);
+            if (!resp) { await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS); continue; }
+            if (resp.startsWith('BBC2')) { c2 = resp; log('Edit: BBC2 received (during retransmit attempts)','warn'); break; }
+            const nextFailed = parseInt(resp.slice(4,6), 16);
+            const nextIdx = parseInt(resp.slice(6,10), 16);
+            if (nextFailed === 1 && nextIdx !== chunkIndex) {
+              log(`Edit: Switching retransmit target to chunk ${nextIdx} (was ${chunkIndex})`,'warn');
+              chunkIndex = nextIdx; attempt = 0; continue;
+            }
+          }
+        }
+        retryAttempts++;
+      }
+    }
+
+    transfer.handlingRetransmits = false;
+    if (!c2) throw new Error('Timeout waiting for BBC2 (edit modal)');
+    const c2Failed = parseInt(c2.slice(4,6),16);
+    if (c2Failed !== 0) {
+      if (IS_MACOS) {
+        log('Edit modal: BBC2 failed on macOS — extra retransmit pass then retrying C2...', 'warn');
+        transfer.handlingRetransmits = true;
+    const extraWindow = 4000; const endAt = Date.now() + extraWindow;
+        while (Date.now() < endAt) {
+          const resp = await waitForAck('BBC1', Math.min(1000, endAt - Date.now())).catch(() => null);
+          if (!resp) continue;
+          const isFailed = parseInt(resp.slice(4,6), 16);
+          if (isFailed === 1) {
+            const chunkIndex = parseInt(resp.slice(6,10), 16);
+            const payload = transfer.chunks.get(chunkIndex);
+            if (payload) { log(`Edit extra-pass resend chunk ${chunkIndex}`, 'warn'); await send(buildCmd('C1', payload, 0)); await sleep(IS_MACOS ? paceMs : CHUNK_DELAY_MS); }
+          }
+        }
+        transfer.handlingRetransmits = false;
+
+        log('Edit modal: Resending C2 (macOS extra retry)...', 'warn');
+        await send(buildCmd('C2','',8));
+        const finalC2 = await waitForAck('BBC2', 10000).catch(() => null);
+        if (!finalC2) throw new Error('Timeout waiting for BBC2 after macOS extra retry (edit modal)');
+        const finalFailed = parseInt(finalC2.slice(4,6), 16);
+        if (finalFailed !== 0) throw new Error('Device reported transfer failed even after macOS extra retry (edit modal)');
+      } else {
+        throw new Error('Device reported failure on end (edit modal)');
+      }
+    }
+
+  // Short settle before C3
+  await sleep(IS_MACOS ? 300 : 300);
     await send(buildCmd('C3', '5C55' + nameHex));
-    const c3 = await waitForAck('BBC3', 3000);
+    const c3 = await waitForAck('BBC3', 15000);  // Long timeout for flash write (especially on macOS)
     if (!c3) throw new Error('Timeout waiting for BBC3');
     const c3Failed = parseInt(c3.slice(4,6),16);
     if (c3Failed !== 0) throw new Error('Device failed final rename');
 
-    edUploadProg.textContent = 'Upload complete ✔';
+  const tEnd = performance.now();
+  const secs = (tEnd - tStart) / 1000;
+  const kb = (size / 1024).toFixed(1);
+  const rate = secs ? (size / secs / 1024).toFixed(1) : '∞';
+  edUploadProg.textContent = `Upload complete ✔ (${kb} KB in ${secs.toFixed(2)}s, ~${rate} KB/s)`;
     log(`Edit modal upload complete for "${targetName}"`, 'warn');
     startFetchFiles();
   } catch (e) {
@@ -1482,12 +1929,302 @@ edUploadBtn.onclick = async () => {
     log('This browser does not support Web Bluetooth. Use Chrome/Edge on desktop or Android over HTTPS.', 'warn');
   }
 
-  // Text-to-Speech (placeholder)
-  $('#btnSendTTS')?.addEventListener('click', () => {
+  // --- Text-to-Speech: ElevenLabs cloud TTS → upload to device and auto-play ---
+  const TTS_STORE_KEY = 'skelly_tts_eleven_key';
+  const TTS_STORE_VOICE = 'skelly_tts_eleven_voice';
+  function ttsLoadKey() { const v = localStorage.getItem(TTS_STORE_KEY) || ''; const el = $('#ttsElevenKey'); if (el) el.value = v; return v; }
+  function ttsSaveKey() { const el = $('#ttsElevenKey'); if (el && el.value) localStorage.setItem(TTS_STORE_KEY, el.value.trim()); }
+  function ttsLoadVoice() { return localStorage.getItem(TTS_STORE_VOICE) || ''; }
+  function ttsSaveVoice(id) { localStorage.setItem(TTS_STORE_VOICE, id || ''); }
+
+  // Cache last preview so Generate & Upload can reuse it if params match
+  const ttsCache = { key: null, u8: null, convU8: null };
+  function ttsComputeKey({ text, voiceId, modelId, stability, similarityBoost, style, speakerBoost }){
+    return JSON.stringify({ text, voiceId, modelId,
+      stability: (typeof stability==='number'&&!Number.isNaN(stability))?stability:null,
+      similarityBoost: (typeof similarityBoost==='number'&&!Number.isNaN(similarityBoost))?similarityBoost:null,
+      style: (typeof style==='number'&&!Number.isNaN(style))?style:null,
+      speakerBoost: !!speakerBoost
+    });
+  }
+
+  async function autoPlayByNameIfPossible(name, timeoutMs = 10000) {
+    try {
+      if (!isConnected()) return;
+      await startFetchFiles(true);
+      const t0 = performance.now();
+      let found = null;
+      while (performance.now() - t0 < timeoutMs) {
+        found = deviceHasFileName(name);
+        if (found) break;
+        await sleep(500);
+      }
+      if (found) {
+        const serial = found.serial >>> 0;
+        log(`Auto-playing uploaded TTS: serial=${serial} name="${found.name}"`);
+        await sleep(300);
+        send(buildCmd('C6', intToHex(serial,2) + '01', PAD_DEFAULT));
+      } else {
+        log('Uploaded TTS not found in list yet; use Play once it appears.', 'warn');
+      }
+    } catch (e) {
+      log('Auto-play error: ' + (e?.message || e), 'warn');
+    }
+  }
+
+  async function ttsFetchVoices(apiKey) {
+    const res = await fetch('https://api.elevenlabs.io/v1/voices', { headers: { 'xi-api-key': apiKey }});
+    if (!res.ok) throw new Error(`Voices fetch failed (${res.status})`);
+    const data = await res.json();
+    return data?.voices || [];
+  }
+  function ttsRenderVoices(voices, selected) {
+    const sel = $('#ttsElevenVoice'); if (!sel) return;
+    sel.innerHTML = voices.map(v => `<option value="${v.voice_id}" ${v.voice_id===selected?'selected':''}>${v.name}</option>`).join('');
+  }
+  async function ttsFetchModels(apiKey){
+    // Try known public models overview first as fallback; prefer API if available
+    // Some accounts can use GET /v1/models; falling back if blocked would be fine.
+    try{
+      const res = await fetch('https://api.elevenlabs.io/v1/models', { headers: { 'xi-api-key': apiKey } });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      // Normalize to list of TTS-capable models with id + label
+      const models = (Array.isArray(data)?data: (data?.models||[]))
+        .filter(m => typeof m?.model_id === 'string')
+        .map(m => ({ id: m.model_id, name: m.name || m.model_id }))
+        // prioritize common TTS models
+        .sort((a,b)=> a.id.localeCompare(b.id));
+      return models;
+    } catch(e){
+      throw new Error('Failed to fetch models: ' + (e?.message || e));
+    }
+  }
+  function ttsRenderModels(models, selected){
+    const sel = $('#ttsModel'); if (!sel) return;
+    if (!Array.isArray(models) || !models.length){
+      log('No models returned for this API key.', 'warn');
+      return;
+    }
+    sel.innerHTML = models.map(m => `<option value="${m.id}" ${m.id===selected?'selected':''}>${m.name}</option>`).join('');
+    // Re-apply tuning visibility for selected model
+    updateTuningVisibility();
+  }
+  function isV3Model(id){ return typeof id === 'string' && /^eleven_v3(_alpha)?$/i.test(id.trim()); }
+  async function ttsGenerate(apiKey, voiceId, text, { modelId, stability, similarityBoost, style, speakerBoost } = {}) {
+    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg'
+      },
+      body: JSON.stringify((()=>{
+        const mid = modelId || 'eleven_multilingual_v2';
+        if (isV3Model(mid)){
+          // V3: omit v2 voice_settings (not applicable)
+          return { text, model_id: mid };
+        } else {
+          return {
+            text,
+            model_id: mid,
+            voice_settings: {
+              stability: typeof stability === 'number' ? stability : 0.5,
+              similarity_boost: typeof similarityBoost === 'number' ? similarityBoost : 0.75,
+              style: typeof style === 'number' ? style : 0.0,
+              use_speaker_boost: !!speakerBoost
+            }
+          };
+        }
+      })())
+    });
+    if (!res.ok) throw new Error(`TTS failed (${res.status})`);
+    const buf = await res.arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  // Preview helpers
+  function getTtsParamsFromUI(){
+    const apiKey = ($('#ttsElevenKey')?.value || '').trim();
+    const voiceId = ($('#ttsElevenVoice')?.value || '').trim();
+    const text = ($('#ttsText')?.value || '').trim();
+    const modelOverride = ($('#ttsModelOverride')?.value || '').trim();
+    const modelId = modelOverride || ($('#ttsModel')?.value || '').trim() || 'eleven_multilingual_v2';
+    const stability = parseFloat(($('#ttsStability')?.value || '0.5'));
+    const similarityBoost = parseFloat(($('#ttsSimilarity')?.value || '0.75'));
+    const style = parseFloat(($('#ttsStyle')?.value || '0'));
+    const speakerBoost = !!$('#ttsSpeakerBoost')?.checked;
+    return { apiKey, voiceId, text, modelId, stability, similarityBoost, style, speakerBoost };
+  }
+
+  // Toggle tuning UI based on model selection/override
+  function updateTuningVisibility(){
+    const modelOverride = ($('#ttsModelOverride')?.value || '').trim();
+    const modelId = modelOverride || ($('#ttsModel')?.value || '').trim();
+    const hide = isV3Model(modelId);
+    document.querySelectorAll('.tts-tuning').forEach(el => el.classList.toggle('hidden', hide));
+  }
+  $('#ttsModel')?.addEventListener('change', updateTuningVisibility);
+  $('#ttsModelOverride')?.addEventListener('input', updateTuningVisibility);
+  updateTuningVisibility();
+  function setPreviewRateBindings(){
+    const range = $('#ttsPreviewRate'); const num = $('#ttsPreviewRateNum'); const audio = $('#ttsAudio');
+    if (!range || !num) return;
+    const sync = (val) => { const v = Math.max(0.5, Math.min(1.5, parseFloat(val)||1)); range.value = String(v); num.value = String(v); if (audio) audio.playbackRate = v; };
+    range.addEventListener('input', e => sync(e.target.value));
+    num.addEventListener('input', e => sync(e.target.value));
+    sync(range.value);
+  }
+  setPreviewRateBindings();
+
+  $('#btnTtsPreview')?.addEventListener('click', async () => {
+    const params = getTtsParamsFromUI();
+    const { apiKey, voiceId, text, modelId, stability, similarityBoost, style, speakerBoost } = params;
+    if (!text) return log('TTS: enter some text first.', 'warn');
+    if (!apiKey || !voiceId) return log('Enter API key and select a voice.', 'warn');
+    try{
+      log('Generating preview…');
+      const u8 = await ttsGenerate(apiKey, voiceId, text, { modelId, stability, similarityBoost, style, speakerBoost });
+      // Update cache
+      ttsCache.key = ttsComputeKey(params);
+      ttsCache.u8 = u8;
+      ttsCache.convU8 = null; // reset converted cache; will (re)build on upload if needed
+  // Enable Upload Preview and update main button label to reflect cache presence
+  const upBtn = $('#btnTtsUploadPreview'); if (upBtn) upBtn.disabled = false;
+  const genBtn = $('#btnSendTTS'); if (genBtn) genBtn.textContent = 'Generate & Upload (New)';
+      const blob = new Blob([u8], { type: 'audio/mpeg' });
+      const url = URL.createObjectURL(blob);
+      const audio = $('#ttsAudio');
+      if (audio){
+        audio.src = url;
+        // ensure current preview rate is applied
+        const rate = parseFloat($('#ttsPreviewRate')?.value || '1.0') || 1.0;
+        audio.playbackRate = Math.max(0.5, Math.min(1.5, rate));
+        await audio.play().catch(()=>{});
+      }
+      log('Preview ready.');
+    } catch(e){
+      log('Preview error: ' + (e?.message || e), 'warn');
+    }
+  });
+
+  // Initialize stored key/voice
+  (function initTTSUI(){
+    const key = ttsLoadKey();
+    const sel = $('#ttsElevenVoice');
+    if (sel) {
+      const saved = ttsLoadVoice();
+      if (key) {
+        ttsFetchVoices(key).then(vs => { ttsRenderVoices(vs, saved); }).catch(e => log('TTS voices error: '+e.message, 'warn'));
+        // Attempt to fetch models for this key and populate dropdown
+        ttsFetchModels(key).then(ms => {
+          if (Array.isArray(ms) && ms.length) {
+            const selected = ($('#ttsModelOverride')?.value || '').trim() || ($('#ttsModel')?.value || '').trim();
+            ttsRenderModels(ms, selected);
+            log(`Loaded ${ms.length} models for this key.`);
+          }
+        }).catch(e => log('TTS models error: ' + e.message, 'warn'));
+      }
+    }
+  })();
+
+  $('#btnTtsRefreshVoices')?.addEventListener('click', async () => {
+    const key = ($('#ttsElevenKey')?.value || '').trim(); if (!key) return log('Enter your ElevenLabs API key.', 'warn');
+    ttsSaveKey();
+    try {
+      const voices = await ttsFetchVoices(key);
+      ttsRenderVoices(voices, ttsLoadVoice());
+      log(`Loaded ${voices.length} voices.`);
+    } catch(e) { log('TTS voices error: '+e.message, 'warn'); }
+  });
+  $('#btnTtsRefreshModels')?.addEventListener('click', async () => {
+    const key = ($('#ttsElevenKey')?.value || '').trim(); if (!key) return log('Enter your ElevenLabs API key.', 'warn');
+    ttsSaveKey();
+    try{
+      const models = await ttsFetchModels(key);
+      const selected = ($('#ttsModelOverride')?.value || '').trim() || ($('#ttsModel')?.value || '').trim();
+      ttsRenderModels(models, selected);
+      log(`Loaded ${models.length} models.`);
+    } catch(e){ log('TTS models error: ' + (e?.message || e), 'warn'); }
+  });
+
+  // Convert options (show/hide bitrate row)
+  $('#ttsChkConvert')?.addEventListener('change', (e)=>{
+    $('#ttsConvertOpts')?.classList.toggle('hidden', !e.target.checked);
+  });
+
+  async function convertIfNeeded(u8){
+    if (!$('#ttsChkConvert')?.checked) return u8;
+    const kbps = parseInt($('#ttsMp3Kbps')?.value || '32', 10);
+    try{
+      const blob = new Blob([u8], { type: 'audio/mpeg' });
+      const { u8: convU8 } = await convertFileToDeviceMp3(blob, kbps);
+      return convU8;
+    } catch(e){
+      log('TTS convert skipped: ' + (e?.message || e), 'warn');
+      return u8;
+    }
+  }
+
+  // Upload the currently previewed audio (no regeneration)
+  $('#btnTtsUploadPreview')?.addEventListener('click', async () => {
     const text = ($('#ttsText').value || '').trim();
     if (!text) return log('TTS: enter some text first.', 'warn');
-    // TODO: implement protocol to send TTS to device
-    log(`TTS requested: "${text}" (not implemented yet)`, 'warn');
+    if (!ttsCache.u8?.length) return log('No preview cached. Click Preview first.', 'warn');
+    const desiredNameRaw = ($('#ttsOutName')?.value || '').trim();
+    let name = desiredNameRaw || `tts_${Date.now()}.mp3`;
+    if (!/\.mp3$/i.test(name)) name += '.mp3';
+    try{
+      let outU8 = ttsCache.convU8?.length ? ttsCache.convU8 : await convertIfNeeded(ttsCache.u8);
+      if (!ttsCache.convU8?.length && $('#ttsChkConvert')?.checked) ttsCache.convU8 = outU8;
+      await sendFileToDevice(outU8, name);
+      log('TTS uploaded (preview). Play it from the Files table.', 'success');
+    } catch(e){
+      log('Upload preview error: ' + (e?.message || e), 'warn');
+    }
+  });
+
+  $('#ttsElevenVoice')?.addEventListener('change', (e) => { ttsSaveVoice(e.target.value); });
+
+  $('#btnSendTTS')?.addEventListener('click', async () => {
+    const text = ($('#ttsText').value || '').trim();
+    if (!text) return log('TTS: enter some text first.', 'warn');
+
+    const params = getTtsParamsFromUI();
+    const { apiKey, voiceId, modelId, stability, similarityBoost, style, speakerBoost } = params;
+    const desiredNameRaw = ($('#ttsOutName')?.value || '').trim();
+    if (!apiKey) return log('Enter your ElevenLabs API key.', 'warn');
+    if (!voiceId) return log('Pick a voice (click Refresh Voices if empty).', 'warn');
+    ttsSaveKey(); ttsSaveVoice(voiceId);
+
+    try {
+      const key = ttsComputeKey(params);
+      let u8 = null;
+      if (ttsCache.key === key && ttsCache.u8?.length) {
+        log('Using cached preview audio (regenerate to create a new version).', 'warn');
+        u8 = ttsCache.u8;
+      } else {
+        log('Generating TTS with ElevenLabs…');
+        u8 = await ttsGenerate(apiKey, voiceId, text, { modelId, stability, similarityBoost, style, speakerBoost });
+        ttsCache.key = key; ttsCache.u8 = u8; ttsCache.convU8 = null;
+      }
+      // Convert to device-friendly MP3 (8kHz mono, 32kbps) for best compatibility
+      let outU8 = u8; let name = desiredNameRaw || `tts_${Date.now()}.mp3`;
+      if (!/\.mp3$/i.test(name)) name += '.mp3';
+      if (ttsCache.key === key && ttsCache.convU8?.length) {
+        outU8 = ttsCache.convU8;
+        log(`Using cached converted MP3 (${outU8.length} bytes).`);
+      } else {
+        outU8 = await convertIfNeeded(u8);
+        if ($('#ttsChkConvert')?.checked) ttsCache.convU8 = outU8;
+        if (outU8 !== u8) log(`Converted TTS to device MP3 (${outU8.length} bytes).`);
+      }
+      // Upload
+      await sendFileToDevice(outU8, name);
+      log('TTS uploaded. Play it from the Files table.', 'success');
+    } catch (e) {
+      log('TTS error: ' + e.message, 'warn');
+    }
   });
 
   function setMoveSelection(rootId, {all=false, head=false, arm=false, torso=false}){
@@ -1663,5 +2400,11 @@ function applyAdvVisibility() {
   if (ftInfo) ftInfo.classList.toggle('hidden', !!advFT.checked); // show info when OFF, hide when ON
 }
 
+// Log platform-specific timing information and version
+log('App version: 2025-10-21 v21 (macOS: <=160B chunks + proactive chunk 0 + C1 with-response + retransmit queue)', 'warn');
+if (IS_MACOS) {
+  log(`macOS detected - using ${CHUNK_DELAY_MS}ms delay between chunks`, 'warn');
+}
 
 })();
+

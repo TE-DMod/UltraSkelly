@@ -98,6 +98,7 @@
     .hidden { display:none !important; }
     .modal { position:fixed; inset:0; background:rgba(0,0,0,.75); display:flex; align-items:center; justify-content:center; z-index:9999; }
     .modal-panel { width:min(720px, 92vw); background:#1b0d0d; border:2px solid #7f1d1d; color:#fecaca; border-radius:16px; padding:22px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+          <a href="https://elevenlabs.io/docs/best-practices/prompting/eleven-v3" target="_blank" rel="noopener noreferrer" aria-label="ElevenLabs v3 prompting best practices (opens in new tab)" title="Prompting tips for Eleven v3" style="margin-left:8px; text-decoration:none; color:var(--muted)">❓</a>
     .modal-panel h3 { margin:0 0 8px; font-size:22px; color:#fecaca; }
     .modal-panel p { margin:8px 0; line-height:1.5; }
     .modal-actions { display:flex; gap:10px; margin-top:16px; justify-content:flex-end; }
@@ -614,21 +615,107 @@
 
     <!-- MIDDLE COL: Text to Speech (bottom) -->
     <section class="card area-empty">
-      <h2>Misc Speech Addons</h2>
-      <div class="subcard upcoming" aria-disabled="true">
-          <div class="subcard-head"><strong>Upcoming:</strong> Text To Speech
+      <h2>Text to Speech</h2>
+      <div class="subcard" aria-disabled="false">
+        <div class="subcard-head"><strong>Generate speech from ElevenLabs API</strong>
+          <a href="https://elevenlabs.io/docs/best-practices/prompting/eleven-v3" target="_blank" rel="noopener noreferrer" aria-label="ElevenLabs v3 prompting best practices (opens in new tab)" title="Prompting tips for Eleven v3" style="margin-left:8px; text-decoration:none; color:var(--muted)">❓</a>
         </div>
         <form id="ttsForm" onsubmit="return false;">
-        <label for="ttsText">Text</label>
-        <textarea id="ttsText" rows="5" placeholder="Type what Skelly should say..."></textarea>
+          <label for="ttsText">Text</label>
+          <textarea id="ttsText" rows="5" placeholder="Type what Skelly should say..."></textarea>
 
-        <div class="actions">
-          <button class="btn primary" id="btnSendTTS">Send</button>
-        </div>
+          <div class="row">
+            <div>
+              <label for="ttsOutName">Output Filename</label>
+              <input id="ttsOutName" placeholder="tts_message.mp3" />
+            </div>
+            <div>
+              <label for="ttsModel">Model</label>
+              <select id="ttsModel">
+                <option value="default" selected>Select</option>
+              </select>
+            </div>
+            <div>
+              <label for="ttsModelOverride">Custom Model ID (optional)</label>
+              <input id="ttsModelOverride" placeholder="e.g., eleven_v3_alpha or custom id" />
+            </div>
+          </div>
 
-        <div class="small muted">TODO: Add effects...</div>
-      </form>
-        </div>
+          <div class="row tts-tuning">
+            <div>
+              <label for="ttsStability">Stability (0–1)</label>
+              <input id="ttsStability" type="number" min="0" max="1" step="0.05" value="0.5" />
+            </div>
+            <div>
+              <label for="ttsSimilarity">Similarity Boost (0–1)</label>
+              <input id="ttsSimilarity" type="number" min="0" max="1" step="0.05" value="0.75" />
+            </div>
+          </div>
+
+          <div class="row tts-tuning">
+            <div>
+              <label for="ttsStyle">Style (0–1)</label>
+              <input id="ttsStyle" type="number" min="0" max="1" step="0.05" value="0" />
+            </div>
+            <div>
+              <label class="checkline" style="margin: 26px 0 0">
+                <input id="ttsSpeakerBoost" type="checkbox" /> Speaker Boost
+              </label>
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="ttsElevenKey">ElevenLabs API Key</label>
+              <input id="ttsElevenKey" type="password" placeholder="xi-api-key" />
+            </div>
+            <div>
+              <label for="ttsElevenVoice">Voice</label>
+              <select id="ttsElevenVoice">
+                <option value="">(Click Refresh Voices)</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="small checkline mt-8">
+            <input id="ttsChkConvert" type="checkbox" checked>
+            Convert to device format (MP3, 8 kHz mono)
+          </label>
+          <div id="ttsConvertOpts" class="row" style="align-items:center">
+            <div>
+              <label for="ttsMp3Kbps">MP3 bitrate</label>
+              <select id="ttsMp3Kbps" aria-label="MP3 bitrate (TTS)">
+                <option value="16">16 kbps</option>
+                <option value="24">24 kbps</option>
+                <option value="32" selected>32 kbps</option>
+              </select>
+            </div>
+            <div class="small muted">Converts ElevenLabs output before uploading.</div>
+          </div>
+
+          
+
+          <div class="actions">
+            <button class="btn sm" id="btnTtsRefreshModels" type="button">Refresh Models</button>
+            <button class="btn sm" id="btnTtsRefreshVoices" type="button">Refresh Voices</button>
+            <button class="btn primary" id="btnSendTTS" type="button">Generate & Upload</button>
+            <button class="btn" id="btnTtsUploadPreview" type="button" disabled>Upload Preview</button>
+            <button class="btn" id="btnTtsPreview" type="button">Preview</button>
+          </div>
+
+          <div class="spacer"></div>
+          <div>
+            <label>Preview speed</label>
+            <div class="row" style="align-items:center">
+              <input id="ttsPreviewRate" type="range" min="0.5" max="1.5" step="0.05" value="1.0" />
+              <input id="ttsPreviewRateNum" type="number" min="0.5" max="1.5" step="0.05" value="1.0" />
+            </div>
+            <audio id="ttsAudio" controls class="mt-8" style="width:100%"></audio>
+          </div>
+
+          <p class="small muted">Your API key is stored in your browser only. The app will fetch TTS audio from ElevenLabs and upload it to the device.</p>
+        </form>
+      </div>
       
       <div class="spacer"></div>
         <div class="subcard upcoming" aria-disabled="true">
@@ -743,6 +830,7 @@
       <h2>Log</h2>
       <div class="actions">
         <button class="btn xs" id="btnClearLog">Clear</button>
+        <button class="btn xs" id="btnSaveLogs">Save Logs</button>
         <label class="small checkline">
           <input type="checkbox" id="chkAutoscroll" checked /> Autoscroll
         </label>
